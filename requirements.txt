@@ -1,0 +1,12 @@
+# torch comes from the base image — do not reinstall it.
+runpod>=1.7.0
+soundfile>=0.12
+numpy>=1.26
+requests>=2.31
+safetensors>=0.4
+huggingface_hub>=0.26
+accelerate>=1.0
+transformers>=4.51
+diffusers>=0.38.0
+sentencepiece>=0.2
+protobuf>=5.0
