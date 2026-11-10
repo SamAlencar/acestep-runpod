@@ -1,4 +1,5 @@
-# torch comes from the base image — do not reinstall it.
+# torch and torchaudio come from the base image / official CUDA wheel.
+# Do not list torch here (it would replace the CUDA build).
 runpod>=1.7.0
 soundfile>=0.12
 numpy>=1.26
@@ -8,5 +9,17 @@ huggingface_hub>=0.26
 accelerate>=1.0
 transformers>=4.51
 diffusers>=0.38.0
-sentencepiece>=0.2
+sentencepiece>=0.1.99
 protobuf>=5.0
+einops
+einops-exts
+alias-free-torch
+dill
+torchsde
+nnAudio
+PyWavelets
+soxr
+tqdm
+v-diffusion-pytorch
+vector-quantize-pytorch==1.14.41
+scipy

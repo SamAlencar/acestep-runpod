@@ -1,16 +1,19 @@
-"""RunPod serverless worker — ACE-Step 1.5 (MIT).
+"""RunPod serverless worker — ACE-Step 1.5 (MIT) and Stable Audio Open Small.
 
 Input: {
   model?, prompt, lyrics?, duration_s?, seed?, num_inference_steps?,
-  bpm?, keyscale?, timesignature?, vocal_language?, budget_usd?, action?
+  bpm?, keyscale?, timesignature?, vocal_language?, cfg_scale?, budget_usd?, action?
 }
 Output: {
   wav_b64, sample_rate, duration_s, channels, model, infer_s, load_s,
   wall_s, estimated_cost_usd, warnings[], gpu_name?
 }
 
-`model` selects the generator. Default: acestep-v15-turbo (official 2B MIT).
-`stable-audio-open-small` is reserved and not enabled yet (needs HF terms + token).
+`model` selects the generator:
+  - acestep-v15-turbo (default, official 2B, MIT)
+  - acestep-v15-xl-turbo (official XL, MIT, more VRAM)
+  - stable-audio-open-small (Community License; needs HF_TOKEN on the endpoint)
+HF_TOKEN is read from the environment only. It is never logged or returned.
 """
 from __future__ import annotations
 
@@ -28,32 +31,43 @@ import torch
 PIPELINES: dict = {}
 LOAD_S: dict = {}
 
-# Conservative default (~A4000 $0.17/h). Override per endpoint.
 COST_PER_GPU_SEC = float(os.environ.get("AUDIOGEN_COST_PER_GPU_SEC", "0.00005"))
 MAX_PROMPT_CHARS = 2000
-MIN_DURATION = 10.0
-MAX_DURATION = 60.0
 DEFAULT_MODEL = "acestep-v15-turbo"
 
-# Official, ungated, MIT weights. Turbo 2B is converted once and cached.
 MODEL_SPECS = {
     "acestep-v15-turbo": {
         "kind": "acestep-official-convert",
         "repo": "ACE-Step/Ace-Step1.5",
         "dit_config": "acestep-v15-turbo",
         "allow_patterns": ["acestep-v15-turbo/*", "vae/*", "Qwen3-Embedding-0.6B/*"],
+        "min_duration": 10.0,
+        "max_duration": 60.0,
+        "default_duration": 24.0,
+        "default_steps": 8,
     },
     "acestep-v15-xl-turbo": {
         "kind": "acestep-diffusers",
         "repo": "ACE-Step/acestep-v15-xl-turbo-diffusers",
+        "min_duration": 10.0,
+        "max_duration": 60.0,
+        "default_duration": 24.0,
+        "default_steps": 8,
     },
-    # Reserved for later. Do not download or run until terms are accepted.
     "stable-audio-open-small": {
         "kind": "stable-audio-open-small",
-        "enabled": False,
         "repo": "stabilityai/stable-audio-open-small",
+        "min_duration": 1.0,
+        "max_duration": 11.0,
+        "default_duration": 8.0,
+        "default_steps": 8,
+        "requires_hf_token": True,
     },
 }
+
+
+def _token_present() -> bool:
+    return bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
 
 
 def cache_root() -> str:
@@ -83,68 +97,155 @@ def _gpu_name() -> str:
         return "cuda"
 
 
+def _park_others(active_id: str) -> None:
+    for mid, obj in list(PIPELINES.items()):
+        if mid == active_id:
+            continue
+        try:
+            if hasattr(obj, "to"):
+                obj.to("cpu")
+        except Exception as e:
+            print(f"[audiogen] park {mid} failed: {e}", flush=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+class SaoSmall:
+    kind = "stable-audio-open-small"
+
+    def __init__(self, model, config, device):
+        self.model = model
+        self.config = config
+        self.device = device
+        self.sample_rate = int(config["sample_rate"])
+        self.sample_size = int(config["sample_size"])
+
+    def to(self, device):
+        self.model = self.model.to(device)
+        self.device = str(device)
+        return self
+
+    def generate(self, prompt: str, duration_s: float, steps: int, seed, cfg_scale: float):
+        from einops import rearrange
+        from stable_audio_tools.inference.generation import generate_diffusion_cond
+
+        device = self.device
+        if seed is not None:
+            torch.manual_seed(int(seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(seed))
+        cond = [{"prompt": prompt, "seconds_total": float(duration_s)}]
+        kwargs = dict(
+            steps=int(steps),
+            cfg_scale=float(cfg_scale),
+            conditioning=cond,
+            sample_size=self.sample_size,
+            sampler_type="pingpong",
+            device=device,
+        )
+        try:
+            output = generate_diffusion_cond(self.model, seed=None if seed is None else int(seed), **kwargs)
+        except TypeError:
+            output = generate_diffusion_cond(self.model, **kwargs)
+        output = rearrange(output, "b d n -> d (b n)").to(torch.float32)
+        peak = torch.max(torch.abs(output))
+        if float(peak) > 0:
+            output = output / peak
+        wav = output.clamp(-1, 1).cpu().numpy()
+        # (channels, samples) — trim to requested duration if the buffer is longer
+        max_n = int(round(float(duration_s) * self.sample_rate))
+        if wav.shape[-1] > max_n > 0:
+            wav = wav[:, :max_n]
+        return wav, self.sample_rate
+
+
 def load_pipeline(model_id: str):
     if model_id in PIPELINES:
-        return PIPELINES[model_id], 0.0, LOAD_S.get(model_id, 0.0)
+        obj = PIPELINES[model_id]
+        _park_others(model_id)
+        if torch.cuda.is_available():
+            try:
+                obj.to("cuda")
+            except torch.cuda.OutOfMemoryError:
+                print(f"[audiogen] OOM moving {model_id} to GPU; trying CPU offload", flush=True)
+                if hasattr(obj, "enable_model_cpu_offload"):
+                    obj.to("cpu")
+                    obj.enable_model_cpu_offload()
+        return obj, 0.0, LOAD_S.get(model_id, 0.0)
 
     spec = MODEL_SPECS.get(model_id)
     if spec is None:
         raise ValueError(f"unknown model {model_id!r}; known: {sorted(MODEL_SPECS)}")
-    if spec.get("enabled") is False or spec["kind"] == "stable-audio-open-small":
+    if spec.get("requires_hf_token") and not _token_present():
         raise RuntimeError(
-            "model stable-audio-open-small is reserved but not enabled: "
-            "accept the Hugging Face terms, register at https://stability.ai/community-license, "
-            "and set HF_TOKEN on the endpoint first"
+            "model stable-audio-open-small requires HF_TOKEN on the endpoint "
+            "(accepted Hugging Face terms + Stability Community License registration)"
         )
 
     cache = cache_root()
+    _park_others(model_id)
     t0 = time.time()
-    from diffusers import AceStepPipeline
 
-    if spec["kind"] == "acestep-diffusers":
-        local = os.path.join(cache, "pipes", model_id)
-        if not os.path.isfile(os.path.join(local, "model_index.json")):
-            pipe = AceStepPipeline.from_pretrained(spec["repo"], torch_dtype=_dtype())
-            os.makedirs(local, exist_ok=True)
-            pipe.save_pretrained(local, safe_serialization=True)
+    if spec["kind"] == "stable-audio-open-small":
+        from stable_audio_tools import get_pretrained_model
+
+        print(f"[audiogen] loading {spec['repo']}", flush=True)
+        model, model_config = get_pretrained_model(spec["repo"])
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        pipe = SaoSmall(model, model_config, device)
+    else:
+        from diffusers import AceStepPipeline
+
+        if spec["kind"] == "acestep-diffusers":
+            local = os.path.join(cache, "pipes", model_id)
+            if not os.path.isfile(os.path.join(local, "model_index.json")):
+                pipe = AceStepPipeline.from_pretrained(spec["repo"], torch_dtype=_dtype())
+                os.makedirs(local, exist_ok=True)
+                pipe.save_pretrained(local, safe_serialization=True)
+            else:
+                pipe = AceStepPipeline.from_pretrained(local, torch_dtype=_dtype())
+        elif spec["kind"] == "acestep-official-convert":
+            converted = os.path.join(cache, "pipes", model_id)
+            if not os.path.isfile(os.path.join(converted, "model_index.json")):
+                from huggingface_hub import snapshot_download
+                from convert_official import convert_official
+
+                src = snapshot_download(
+                    repo_id=spec["repo"],
+                    allow_patterns=spec["allow_patterns"],
+                    cache_dir=cache,
+                )
+                convert_official(
+                    src,
+                    spec["dit_config"],
+                    converted,
+                    "bf16" if _dtype() is torch.bfloat16 else "fp16",
+                )
+            pipe = AceStepPipeline.from_pretrained(converted, torch_dtype=_dtype())
         else:
-            pipe = AceStepPipeline.from_pretrained(local, torch_dtype=_dtype())
-    elif spec["kind"] == "acestep-official-convert":
-        converted = os.path.join(cache, "pipes", model_id)
-        if not os.path.isfile(os.path.join(converted, "model_index.json")):
-            from huggingface_hub import snapshot_download
-            from convert_official import convert_official
+            raise ValueError(f"unsupported kind {spec['kind']}")
 
-            src = snapshot_download(
-                repo_id=spec["repo"],
-                allow_patterns=spec["allow_patterns"],
-                cache_dir=cache,
-            )
-            convert_official(src, spec["dit_config"], converted, "bf16" if _dtype() is torch.bfloat16 else "fp16")
-        pipe = AceStepPipeline.from_pretrained(converted, torch_dtype=_dtype())
-    else:
-        raise ValueError(f"unsupported kind {spec['kind']}")
-
-    if torch.cuda.is_available():
-        try:
-            pipe = pipe.to("cuda")
-        except torch.cuda.OutOfMemoryError:
-            print("[acestep] OOM on full GPU load, falling back to CPU offload", flush=True)
-            pipe.to("cpu")
-            if hasattr(pipe, "enable_model_cpu_offload"):
-                pipe.enable_model_cpu_offload()
-        if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
+        if torch.cuda.is_available():
             try:
-                pipe.vae.enable_tiling()
-            except Exception as e:
-                print(f"[acestep] vae tiling skipped: {e}", flush=True)
-    else:
-        print("[acestep] CUDA not available; running on CPU (slow)", flush=True)
+                pipe = pipe.to("cuda")
+            except torch.cuda.OutOfMemoryError:
+                print("[audiogen] OOM on full GPU load, falling back to CPU offload", flush=True)
+                pipe.to("cpu")
+                if hasattr(pipe, "enable_model_cpu_offload"):
+                    pipe.enable_model_cpu_offload()
+            if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
+                try:
+                    pipe.vae.enable_tiling()
+                except Exception as e:
+                    print(f"[audiogen] vae tiling skipped: {e}", flush=True)
+        else:
+            print("[audiogen] CUDA not available; running on CPU (slow)", flush=True)
 
     load_s = time.time() - t0
     PIPELINES[model_id] = pipe
     LOAD_S[model_id] = load_s
-    print(f"[acestep] {model_id} ready in {load_s:.1f}s on {_gpu_name()}", flush=True)
+    print(f"[audiogen] {model_id} ready in {load_s:.1f}s on {_gpu_name()}", flush=True)
     return pipe, load_s, load_s
 
 
@@ -155,14 +256,10 @@ def _to_wav_bytes(audio, sample_rate: int):
     if hasattr(wav, "cpu"):
         wav = wav.cpu()
     wav = np.asarray(wav).astype(np.float32)
-    # (channels, samples) or (samples, channels) or (samples,)
     if wav.ndim == 3:
         wav = wav[0]
     if wav.ndim == 2 and wav.shape[0] < wav.shape[1]:
-        # (C, S) -> (S, C)
         wav = wav.T
-    elif wav.ndim == 1:
-        pass
     peak = float(np.max(np.abs(wav))) if wav.size else 0.0
     if peak > 1.0:
         wav = wav / peak
@@ -178,57 +275,71 @@ def handler(event):
     job = event.get("input") or {}
     warnings = []
     if job.get("action") == "ping":
-        return {"ok": True, "gpu_name": _gpu_name(), "models": sorted(MODEL_SPECS), "wall_s": round(time.time() - t_wall, 2)}
+        return {
+            "ok": True,
+            "gpu_name": _gpu_name(),
+            "models": sorted(MODEL_SPECS),
+            "hf_token_present": _token_present(),
+            "wall_s": round(time.time() - t_wall, 2),
+        }
 
     model_id = (job.get("model") or os.environ.get("AUDIOGEN_DEFAULT_MODEL") or DEFAULT_MODEL).strip()
+    spec = MODEL_SPECS.get(model_id)
+    if spec is None:
+        return {"error": f"unknown model {model_id!r}; known: {sorted(MODEL_SPECS)}"}
+
     prompt = (job.get("prompt") or "").strip()
     if not prompt:
         return {"error": "prompt required"}
     if len(prompt) > MAX_PROMPT_CHARS:
         return {"error": f"prompt too long ({len(prompt)} > {MAX_PROMPT_CHARS})"}
 
-    duration_s = float(job.get("duration_s") or 24)
-    if duration_s < MIN_DURATION or duration_s > MAX_DURATION:
-        return {"error": f"duration_s must be between {MIN_DURATION} and {MAX_DURATION}"}
+    min_d, max_d = spec["min_duration"], spec["max_duration"]
+    duration_s = float(job.get("duration_s") or spec["default_duration"])
+    if duration_s < min_d or duration_s > max_d:
+        return {"error": f"duration_s for {model_id} must be between {min_d} and {max_d}"}
 
     budget = job.get("budget_usd")
     if budget is not None and float(budget) <= 0:
         return {"error": "budget_usd must be > 0"}
 
-    lyrics = job.get("lyrics")
-    if lyrics is None:
-        lyrics = ""
-    steps = int(job.get("num_inference_steps") or 8)
+    lyrics = "" if job.get("lyrics") is None else job.get("lyrics")
+    steps = int(job.get("num_inference_steps") or spec["default_steps"])
     seed = job.get("seed")
     vocal_language = job.get("vocal_language") or "en"
+    cfg_scale = float(job.get("cfg_scale") or (1.0 if spec["kind"] == "stable-audio-open-small" else 7.0))
 
     try:
         pipe, this_load_s, first_load_s = load_pipeline(model_id)
-        sample_rate = int(getattr(pipe, "sample_rate", 48000) or 48000)
-        kwargs = {
-            "prompt": prompt,
-            "lyrics": lyrics,
-            "audio_duration": duration_s,
-            "num_inference_steps": steps,
-            "vocal_language": vocal_language,
-        }
-        if job.get("bpm") is not None:
-            kwargs["bpm"] = int(job["bpm"])
-        if job.get("keyscale"):
-            kwargs["keyscale"] = job["keyscale"]
-        if job.get("timesignature"):
-            kwargs["timesignature"] = str(job["timesignature"])
-        if seed is not None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            kwargs["generator"] = torch.Generator(device=device).manual_seed(int(seed))
-
         t1 = time.time()
-        with torch.inference_mode():
-            out = pipe(**kwargs)
-        infer_s = time.time() - t1
+        if getattr(pipe, "kind", None) == "stable-audio-open-small":
+            wav, sample_rate = pipe.generate(prompt, duration_s, steps, seed, cfg_scale)
+            infer_s = time.time() - t1
+            wav_bytes, channels, n_samples, peak = _to_wav_bytes(wav, sample_rate)
+        else:
+            sample_rate = int(getattr(pipe, "sample_rate", 48000) or 48000)
+            kwargs = {
+                "prompt": prompt,
+                "lyrics": lyrics,
+                "audio_duration": duration_s,
+                "num_inference_steps": steps,
+                "vocal_language": vocal_language,
+            }
+            if job.get("bpm") is not None:
+                kwargs["bpm"] = int(job["bpm"])
+            if job.get("keyscale"):
+                kwargs["keyscale"] = job["keyscale"]
+            if job.get("timesignature"):
+                kwargs["timesignature"] = str(job["timesignature"])
+            if seed is not None:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                kwargs["generator"] = torch.Generator(device=device).manual_seed(int(seed))
+            with torch.inference_mode():
+                out = pipe(**kwargs)
+            infer_s = time.time() - t1
+            audios = getattr(out, "audios", out[0] if isinstance(out, (list, tuple)) else out)
+            wav_bytes, channels, n_samples, peak = _to_wav_bytes(audios, sample_rate)
 
-        audios = getattr(out, "audios", out[0] if isinstance(out, (list, tuple)) else out)
-        wav_bytes, channels, n_samples, peak = _to_wav_bytes(audios, sample_rate)
         elapsed = time.time() - t_wall
         cost = round(elapsed * COST_PER_GPU_SEC, 5)
         if budget is not None and cost > float(budget):
@@ -252,8 +363,14 @@ def handler(event):
             "warnings": warnings,
         }
     except Exception as e:
+        # Never include environment or token material in the error payload.
+        msg = str(e)
+        for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "RUNPOD_API_KEY"):
+            val = os.environ.get(key) or ""
+            if val:
+                msg = msg.replace(val, "<redacted>")
         return {
-            "error": str(e),
+            "error": msg,
             "trace": traceback.format_exc()[-2000:],
             "wall_s": round(time.time() - t_wall, 2),
             "gpu_name": _gpu_name(),

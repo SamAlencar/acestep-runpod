@@ -1,11 +1,14 @@
-# ACE-Step 1.5 RunPod Serverless worker
+# ACE-Step 1.5 + Stable Audio Open Small — RunPod Serverless worker
 
-Worker local para gerar trilhas com [ACE-Step 1.5](https://huggingface.co/ACE-Step/Ace-Step1.5) (MIT) no RunPod Serverless.
+Worker para gerar trilhas e SFX no RunPod Serverless.
+
+| Modelo (`model`) | Licença | Uso |
+|---|---|---|
+| `acestep-v15-turbo` (padrão) | MIT | Trilhas 10–60 s, 48 kHz |
+| `acestep-v15-xl-turbo` | MIT | Trilhas, mais VRAM |
+| `stable-audio-open-small` | Stability AI Community License | SFX e clips até 11 s, 44,1 kHz. Exige `HF_TOKEN` no *endpoint*, aceite dos termos no Hugging Face e registro em https://stability.ai/community-license se o uso for comercial. |
 
 - Código deste worker: MIT
-- Pesos padrão `acestep-v15-turbo`: MIT
 - Imagem: `ghcr.io/samalencar/acestep-runpod:latest`
 
-O handler aceita o parâmetro `model`. O modelo `stable-audio-open-small` está reservado e ainda não é executado (exige aceite de termos, registro Community License e `HF_TOKEN`).
-
-Não commitar chaves. `HF_TOKEN` e `RUNPOD_API_KEY` entram só como variáveis de ambiente do endpoint.
+O token do Hugging Face entra só como variável de ambiente do endpoint RunPod. Não commitar chaves, não passar `HF_TOKEN` como build-arg, não gravar segredos no repositório.
