@@ -25,7 +25,7 @@ if [ ! -f /opt/.audiogen-deps-ok ]; then
   pip install --no-cache-dir torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
   pip install --no-cache-dir -r /app/requirements.txt
   pip install --no-cache-dir --no-deps --ignore-requires-python "stable-audio-tools==0.0.20"
-  python -c "import torch,torchaudio,diffusers,runpod,stable_audio_tools; print('deps-ok', torch.__version__, torch.version.cuda, flush=True)"
+  python -c "import torch,torchaudio,diffusers,transformers,runpod,pytorch_lightning; from stable_audio_tools import get_pretrained_model; from stable_audio_tools.inference.generation import generate_diffusion_cond; from stable_audio_tools.models.dit import DiffusionTransformer; print('deps-ok', torch.__version__, torch.version.cuda, flush=True)"
   touch /opt/.audiogen-deps-ok
 fi
 cd /app

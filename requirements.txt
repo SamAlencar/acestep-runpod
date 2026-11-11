@@ -23,3 +23,10 @@ tqdm
 v-diffusion-pytorch
 vector-quantize-pytorch==1.14.41
 scipy
+# Required at import time by SAO Small (diffusion_cond + DiT):
+# models/dit.py -> models/lora/__init__.py -> models/lora/callbacks.py
+# Official SAT 0.0.20 lists this under the train extra, but the inference
+# path still imports it. Do not install the rest of the train extra
+# (wandb, webdataset, laion-clap, etc.); those are not on the SAO load path.
+# k-diffusion and ema-pytorch are vendored inside stable-audio-tools.
+pytorch_lightning==2.5.5
